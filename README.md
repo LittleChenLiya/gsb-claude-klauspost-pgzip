@@ -131,3 +131,26 @@ I haven't included [bgzf](https://godoc.org/github.com/biogo/hts/bgzf) in this c
 
 # License
 This contains large portions of code from the go repository - see GO_LICENSE for more information. The changes are released under MIT License. See LICENSE for more information.
+
+Member manifest
+====
+
+A `Reader` records an explicit per-member manifest while decompressing,
+so a concatenated gzip file is not treated as a single member.
+After reading to `io.EOF` (or an error), `Reader.Manifest()` returns one
+`MemberInfo` per gzip member with its compressed byte range, decompressed
+length and CRC verification result. The manifest is built during
+decompression and never requires re-decompressing the input.
+
+* Header name and comment are only exposed when the header flags allow them.
+* A truncated member is reported as incomplete (`Truncated`); members before
+  it remain auditable.
+* Bytes after the last complete member that do not form a gzip member are
+  reported separately as `Manifest.Trailing`.
+* The default `Reader` output is unchanged.
+
+Run the manifest tests and the two-member example with:
+
+```
+go test -run 'Manifest|ExampleReader_Manifest' -v .
+```

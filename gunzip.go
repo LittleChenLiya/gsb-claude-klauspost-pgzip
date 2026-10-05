@@ -100,11 +100,31 @@ type Reader struct {
 	mu               sync.Mutex  // Lock for channels during killReadAhead
 
 	blockPool chan []byte
+
+	// Member manifest state. Recorded while decompressing,
+	// so the manifest never requires re-decompressing the input.
+	cr          *countReader // counts compressed bytes consumed
+	manifestMu  sync.Mutex   // guards members, curMember and trailing
+	members     []MemberInfo // one entry per gzip member
+	curMember   int          // index of the member being read, -1 before the first
+	memberStart int64        // compressed offset of the current/next member
+	trailing    int64        // non-member bytes after the last complete member
 }
 
 type read struct {
 	b   []byte
 	err error
+}
+
+// initStream wraps r so compressed byte consumption is counted
+// for the member manifest, and resets the manifest state.
+func (z *Reader) initStream(r io.Reader) {
+	z.cr = &countReader{r: makeReader(r)}
+	z.r = z.cr
+	z.members = nil
+	z.curMember = -1
+	z.memberStart = 0
+	z.trailing = 0
 }
 
 // NewReader creates a new Reader reading the given reader.
@@ -114,7 +134,7 @@ func NewReader(r io.Reader) (*Reader, error) {
 	z := new(Reader)
 	z.blocks = defaultBlocks
 	z.blockSize = defaultBlockSize
-	z.r = makeReader(r)
+	z.initStream(r)
 	z.digest = crc32.NewIEEE()
 	z.multistream.Store(true)
 	z.blockPool = make(chan []byte, z.blocks)
@@ -142,7 +162,7 @@ func NewReaderN(r io.Reader, blockSize, blocks int) (*Reader, error) {
 	z := new(Reader)
 	z.blocks = blocks
 	z.blockSize = blockSize
-	z.r = makeReader(r)
+	z.initStream(r)
 	z.digest = crc32.NewIEEE()
 	z.multistream.Store(true)
 
@@ -168,7 +188,7 @@ func NewReaderN(r io.Reader, blockSize, blocks int) (*Reader, error) {
 // This permits reusing a Reader rather than allocating a new one.
 func (z *Reader) Reset(r io.Reader) error {
 	z.killReadAhead()
-	z.r = makeReader(r)
+	z.initStream(r)
 	z.digest = crc32.NewIEEE()
 	z.size = 0
 	z.err = nil
@@ -260,6 +280,9 @@ func (z *Reader) read2() (uint32, error) {
 }
 
 func (z *Reader) readHeader(save bool) error {
+	// Record where this member starts for the manifest.
+	z.startMember()
+	var member MemberInfo
 	_, err := io.ReadFull(z.r, z.buf[0:10])
 	if err != nil {
 		return err
@@ -296,6 +319,8 @@ func (z *Reader) readHeader(save bool) error {
 		if s, err = z.readString(); err != nil {
 			return err
 		}
+		// Expose the name in the manifest only when the flag allows it.
+		member.Name, member.HasName = s, true
 		if save {
 			z.Name = s
 		}
@@ -305,6 +330,8 @@ func (z *Reader) readHeader(save bool) error {
 		if s, err = z.readString(); err != nil {
 			return err
 		}
+		// Expose the comment in the manifest only when the flag allows it.
+		member.Comment, member.HasComment = s, true
 		if save {
 			z.Comment = s
 		}
@@ -322,6 +349,8 @@ func (z *Reader) readHeader(save bool) error {
 	}
 
 	z.digest.Reset()
+	// Header is valid; record the member in the manifest.
+	z.addMember(member)
 	if r, ok := z.decompressor.(flate.Resetter); ok {
 		if err := r.Reset(z.r, nil); err != nil {
 			return err
@@ -437,7 +466,10 @@ func (z *Reader) doReadAhead() {
 				if _, err = io.ReadFull(z.r, z.buf[0:8]); err == nil {
 					crc32, isize := get4(z.buf[0:4]), get4(z.buf[4:8])
 					sum := z.digest.Sum32()
-					if sum != crc32 || isize != z.size {
+					ok := sum == crc32 && isize == z.size
+					// Record the verification result of this member.
+					z.finishMember(crc32, ok)
+					if !ok {
 						err = ErrChecksum
 					} else {
 						// File is ok; should we attempt reading one more?
@@ -445,9 +477,20 @@ func (z *Reader) doReadAhead() {
 							err = io.EOF
 						} else {
 							err = z.readHeader(false)
+							if err != nil && err != io.EOF {
+								// Bytes after the last complete member that do
+								// not form a gzip member are recorded separately.
+								z.setTrailing()
+							}
 						}
 					}
+				} else {
+					// Trailer could not be read completely.
+					z.truncateMember()
 				}
+			} else if err != nil {
+				// Stream ended or failed before a complete member.
+				z.truncateMember()
 			}
 			if err == nil && len(buf) == 0 {
 				z.blockPool <- buf
