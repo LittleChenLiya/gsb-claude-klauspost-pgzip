@@ -35,6 +35,40 @@ const (
 	HuffmanOnly         = flate.HuffmanOnly
 )
 
+// flateWriter is the subset of *flate.Writer used to compress a block.
+// Tests may replace z.dictFlatePool.New with a fake that satisfies this
+// interface to control compression ordering and inject errors.
+type flateWriter interface {
+	Write(p []byte) (n int, err error)
+	Flush() error
+	Close() error
+	ResetDict(dst io.Writer, dict []byte)
+}
+
+// BlockReceipt is an optional acknowledgment that a block has been committed
+// to the underlying writer. Receipts are delivered in commit order, which is
+// the order the blocks were enqueued. A block is only committed once every
+// preceding block has been committed; a failed block is never overtaken by a
+// later block.
+type BlockReceipt struct {
+	// Seq is the block sequence number, starting at 0.
+	Seq uint64
+	// InputOffset is the offset of the block's uncompressed data in the
+	// stream of bytes written to the Writer.
+	InputOffset int64
+	// InputLen is the length of the block's uncompressed data.
+	InputLen int
+	// OutputOffset is the offset in the underlying output stream where the
+	// compressed block was written. It is zero if the block failed.
+	OutputOffset int64
+	// OutputLen is the number of compressed bytes written for the block.
+	// It is zero if the block failed.
+	OutputLen int
+	// Err is non-nil if the block could not be committed. Once a block
+	// fails, no further receipts are delivered.
+	Err error
+}
+
 // A Writer is an io.WriteCloser.
 // Writes to a Writer are compressed and written to w.
 type Writer struct {
@@ -53,15 +87,37 @@ type Writer struct {
 	errMu         sync.RWMutex
 	err           error
 	pushedErr     chan struct{}
-	results       chan result
+	results       chan *result
 	dictFlatePool sync.Pool
 	dstPool       sync.Pool
 	wg            sync.WaitGroup
+
+	// Block receipt support. receipts is nil until BlockReceipts is called.
+	// The committer goroutine captures the channel at startup and owns it;
+	// it emits receipts in commit order and closes the channel on exit.
+	receiptsMu sync.Mutex
+	receipts   chan BlockReceipt
+
+	// seq and inputOffset track the enqueue order and uncompressed input
+	// offset of the next block. They are only accessed from the caller's
+	// goroutine (Write/Flush/Close).
+	seq         uint64
+	inputOffset int64
+	// headerLen is the number of bytes written for the GZIP header. It is
+	// set when the header is written and used to offset output ranges.
+	headerLen int
 }
 
 type result struct {
+	seq           uint64
+	inputOffset   int64
+	inputLen      int
 	result        chan []byte
 	notifyWritten chan struct{}
+	// err is set by the compressBlock goroutine if compression fails. It
+	// is written before result is closed, so the committer observes it via
+	// the happens-before established by the channel close.
+	err error
 }
 
 // Use SetConcurrency to finetune the concurrency level if needed.
@@ -83,7 +139,7 @@ func (z *Writer) SetConcurrency(blockSize, blocks int) error {
 		return nil
 	}
 	z.blockSize = blockSize
-	z.results = make(chan result, blocks)
+	z.results = make(chan *result, blocks)
 	z.blocks = blocks
 	z.dstPool.New = func() any { return make([]byte, 0, blockSize+(blockSize)>>4) }
 	return nil
@@ -148,7 +204,7 @@ func (z *Writer) init(w io.Writer, level int) {
 	z.level = level
 	z.digest = digest
 	z.pushedErr = make(chan struct{}, 0)
-	z.results = make(chan result, z.blocks)
+	z.results = make(chan *result, z.blocks)
 	z.err = nil
 	z.closed = false
 	z.Comment = ""
@@ -165,6 +221,12 @@ func (z *Writer) init(w io.Writer, level int) {
 		z.prevTail = nil
 	}
 	z.size = 0
+	z.seq = 0
+	z.inputOffset = 0
+	z.headerLen = 0
+	z.receiptsMu.Lock()
+	z.receipts = nil
+	z.receiptsMu.Unlock()
 	if z.dictFlatePool.New == nil {
 		z.dictFlatePool.New = func() any {
 			f, _ := flate.NewWriterDict(w, level, nil)
@@ -183,6 +245,25 @@ func (z *Writer) Reset(w io.Writer) {
 	}
 	z.SetConcurrency(defaultBlockSize, runtime.GOMAXPROCS(0))
 	z.init(w, z.level)
+}
+
+// BlockReceipts opts in to block receipts and returns the channel on which
+// they are delivered. A receipt is sent for each block in commit order once
+// the block has been written to the underlying writer. If a block fails, a
+// receipt carrying the error is sent for that block and the channel is
+// closed; no further receipts are delivered.
+//
+// BlockReceipts must be called before the first Write (or Flush/Close that
+// triggers a Write) for the receipts to be delivered. The returned channel
+// is closed when the Writer is closed or reset. The channel is buffered;
+// callers should read from it promptly to avoid stalling the writer.
+func (z *Writer) BlockReceipts() <-chan BlockReceipt {
+	z.receiptsMu.Lock()
+	defer z.receiptsMu.Unlock()
+	if z.receipts == nil {
+		z.receipts = make(chan BlockReceipt, 256)
+	}
+	return z.receipts
 }
 
 // GZIP (RFC 1952) is little-endian, unlike ZLIB (RFC 1950).
@@ -255,9 +336,14 @@ func (z *Writer) compressCurrent(flush bool) {
 	r := result{}
 	r.result = make(chan []byte, 1)
 	r.notifyWritten = make(chan struct{}, 0)
+	r.seq = z.seq
+	r.inputOffset = z.inputOffset
+	r.inputLen = len(c)
+	z.seq++
+	z.inputOffset += int64(len(c))
 	// Reserve a result slot
 	select {
-	case z.results <- r:
+	case z.results <- &r:
 	case <-z.pushedErr:
 		return
 	}
@@ -273,7 +359,7 @@ func (z *Writer) compressCurrent(flush bool) {
 	} else {
 		z.prevTail = nil
 	}
-	go z.compressBlock(c, tail, r, z.closed)
+	go z.compressBlock(c, tail, &r, z.closed)
 
 	z.currentBuffer = z.dstPool.Get().([]byte) // Put in .compressBlock
 	z.currentBuffer = z.currentBuffer[:0]
@@ -308,6 +394,9 @@ func (z *Writer) checkError() error {
 func (z *Writer) Write(p []byte) (int, error) {
 	if err := z.checkError(); err != nil {
 		return 0, err
+	}
+	if z.closed {
+		return 0, errors.New("gzip: write after close")
 	}
 	// Write the GZIP header lazily.
 	if !z.wroteHeader {
@@ -362,35 +451,104 @@ func (z *Writer) Write(p []byte) (int, error) {
 				return n, err
 			}
 		}
-		// Start receiving data from compressors
+		// Compute the number of bytes written for the GZIP header so that
+		// block output ranges can be reported accurately.
+		z.headerLen = 10
+		if z.Extra != nil {
+			z.headerLen += 2 + len(z.Extra)
+		}
+		if z.Name != "" {
+			z.headerLen += len(z.Name) + 1
+		}
+		if z.Comment != "" {
+			z.headerLen += len(z.Comment) + 1
+		}
+		// Start receiving data from compressors. The committer is the only
+		// goroutine that writes blocks to the underlying writer, so it can
+		// commit blocks in the order they were enqueued and emit receipts.
+		z.receiptsMu.Lock()
+		receipts := z.receipts
+		z.receiptsMu.Unlock()
 		go func() {
 			listen := z.results
 			var failed bool
+			outputOffset := int64(z.headerLen)
 			for {
 				r, ok := <-listen
 				// If closed, we are finished.
 				if !ok {
+					if receipts != nil {
+						close(receipts)
+					}
 					return
 				}
 				if failed {
 					close(r.notifyWritten)
 					continue
 				}
-				buf := <-r.result
+				buf, ok := <-r.result
+				if !ok {
+					// Compression failed. r.err was set by the failing
+					// worker before it closed r.result.
+					failed = true
+					if r.err != nil {
+						z.pushError(r.err)
+					}
+					if receipts != nil {
+						receipts <- BlockReceipt{
+							Seq:         r.seq,
+							InputOffset: r.inputOffset,
+							InputLen:    r.inputLen,
+							Err:         r.err,
+						}
+					}
+					close(r.notifyWritten)
+					continue
+				}
 				n, err := z.w.Write(buf)
 				if err != nil {
 					z.pushError(err)
-					close(r.notifyWritten)
 					failed = true
+					if receipts != nil {
+						receipts <- BlockReceipt{
+							Seq:          r.seq,
+							InputOffset:  r.inputOffset,
+							InputLen:     r.inputLen,
+							OutputOffset: outputOffset,
+							Err:          err,
+						}
+					}
+					close(r.notifyWritten)
 					continue
 				}
 				if n != len(buf) {
-					z.pushError(fmt.Errorf("gzip: short write %d should be %d", n, len(buf)))
+					err := fmt.Errorf("gzip: short write %d should be %d", n, len(buf))
+					z.pushError(err)
 					failed = true
+					if receipts != nil {
+						receipts <- BlockReceipt{
+							Seq:          r.seq,
+							InputOffset:  r.inputOffset,
+							InputLen:     r.inputLen,
+							OutputOffset: outputOffset,
+							OutputLen:    n,
+							Err:          err,
+						}
+					}
 					close(r.notifyWritten)
 					continue
 				}
 				z.dstPool.Put(buf)
+				if receipts != nil {
+					receipts <- BlockReceipt{
+						Seq:          r.seq,
+						InputOffset:  r.inputOffset,
+						InputLen:     r.inputLen,
+						OutputOffset: outputOffset,
+						OutputLen:    n,
+					}
+				}
+				outputOffset += int64(n)
 				close(r.notifyWritten)
 			}
 		}()
@@ -423,7 +581,7 @@ func (z *Writer) Write(p []byte) (int, error) {
 // Step 1: compresses buffer to buffer
 // Step 2: send writer to channel
 // Step 3: Close result channel to indicate we are done
-func (z *Writer) compressBlock(p, prevTail []byte, r result, closed bool) {
+func (z *Writer) compressBlock(p, prevTail []byte, r *result, closed bool) {
 	defer func() {
 		close(r.result)
 		z.wg.Done()
@@ -431,20 +589,39 @@ func (z *Writer) compressBlock(p, prevTail []byte, r result, closed bool) {
 	buf := z.dstPool.Get().([]byte) // Corresponding Put in .Write's result writer
 	dest := bytes.NewBuffer(buf[:0])
 
-	compressor := z.dictFlatePool.Get().(*flate.Writer) // Put below
+	compressor := z.dictFlatePool.Get().(flateWriter) // Put below
 	compressor.ResetDict(dest, prevTail)
-	compressor.Write(p)
+	_, err := compressor.Write(p)
 	z.dstPool.Put(p) // Corresponding Get in .Write and .compressCurrent
-
-	err := compressor.Flush()
 	if err != nil {
+		r.err = err
 		z.pushError(err)
+		z.dictFlatePool.Put(compressor)
+		if prevTail != nil {
+			z.dstPool.Put(prevTail)
+		}
+		return
+	}
+
+	err = compressor.Flush()
+	if err != nil {
+		r.err = err
+		z.pushError(err)
+		z.dictFlatePool.Put(compressor)
+		if prevTail != nil {
+			z.dstPool.Put(prevTail)
+		}
 		return
 	}
 	if closed {
 		err = compressor.Close()
 		if err != nil {
+			r.err = err
 			z.pushError(err)
+			z.dictFlatePool.Put(compressor)
+			if prevTail != nil {
+				z.dstPool.Put(prevTail)
+			}
 			return
 		}
 	}
@@ -495,21 +672,23 @@ func (z *Writer) UncompressedSize() int {
 // Close closes the Writer, flushing any unwritten data to the underlying
 // io.Writer, but does not close the underlying io.Writer.
 func (z *Writer) Close() error {
-	if err := z.checkError(); err != nil {
-		return err
-	}
 	if z.closed {
 		return nil
 	}
-
-	z.closed = true
+	if err := z.checkError(); err != nil {
+		return err
+	}
 	if !z.wroteHeader {
-		z.Write(nil)
-		if err := z.checkError(); err != nil {
+		if _, err := z.Write(nil); err != nil {
 			return err
 		}
 	}
+	z.closed = true
 	z.compressCurrent(true)
+	// Reap all compression workers exactly once before checking errors.
+	// The closed check in Write guarantees no new blocks are enqueued
+	// after this point, so wg.Wait cannot race with wg.Add.
+	z.wg.Wait()
 	if err := z.checkError(); err != nil {
 		return err
 	}
