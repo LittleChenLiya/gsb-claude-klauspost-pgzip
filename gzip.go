@@ -39,7 +39,12 @@ const (
 // Writes to a Writer are compressed and written to w.
 type Writer struct {
 	Header
-	w             io.Writer
+	w io.Writer
+	// frozen is a snapshot of Header taken by FreezeHeader.
+	// When non-nil it is used instead of Header when the GZIP
+	// header is first written, so later mutations of the
+	// embedded Header fields do not affect the output.
+	frozen        *Header
 	level         int
 	wroteHeader   bool
 	blockSize     int
@@ -144,6 +149,7 @@ func (z *Writer) init(w io.Writer, level int) {
 		digest = crc32.NewIEEE()
 	}
 	z.Header = Header{OS: 255}
+	z.frozen = nil
 	z.w = w
 	z.level = level
 	z.digest = digest
@@ -183,6 +189,70 @@ func (z *Writer) Reset(w io.Writer) {
 	}
 	z.SetConcurrency(defaultBlockSize, runtime.GOMAXPROCS(0))
 	z.init(w, z.level)
+}
+
+// FreezeHeader takes an explicit, immutable snapshot of the current
+// Header fields. After a successful freeze, later changes to the
+// embedded Writer.Header (Name, Extra, Comment, ModTime, OS) are
+// ignored when the GZIP header is written for the first time.
+//
+// FreezeHeader is opt-in: when it is never called, the Writer keeps
+// its original behavior and reads the Header fields lazily on the
+// first Write, Flush or Close.
+//
+// The Header is validated at freeze time. An invalid Header (Extra
+// longer than 65535 bytes, or a Name/Comment containing NUL bytes or
+// non-Latin-1 runes) makes FreezeHeader return an error before any
+// output byte has been produced; the Writer then stays in an error
+// state and must be Reset before it can be used again.
+//
+// Freezing after the GZIP header has already been written (or after
+// Close) returns an error. FreezeHeader may be called more than once
+// before the first write; each call replaces the previous snapshot
+// with the current Header. Reset clears any frozen snapshot, so the
+// Header can be configured and frozen again afterwards.
+func (z *Writer) FreezeHeader() error {
+	if z.closed || z.wroteHeader {
+		return errors.New("gzip: FreezeHeader called after header has been written")
+	}
+	if err := validateHeader(&z.Header); err != nil {
+		// Fail before a single byte is emitted and keep the Writer
+		// unusable until Reset, matching the documented contract.
+		z.pushError(err)
+		return err
+	}
+	h := z.Header
+	// Copy Extra so later mutations of the caller's slice backing
+	// array cannot change the frozen snapshot.
+	if z.Header.Extra != nil {
+		h.Extra = append(make([]byte, 0, len(z.Header.Extra)), z.Header.Extra...)
+	}
+	z.frozen = &h
+	return nil
+}
+
+// validateHeader reports whether h can be serialized into a GZIP
+// header. It checks the same constraints that Write otherwise checks
+// while emitting the header.
+func validateHeader(h *Header) error {
+	if len(h.Extra) > 0xffff {
+		return errors.New("gzip.Write: Extra data is too large")
+	}
+	if err := validateHeaderString(h.Name); err != nil {
+		return err
+	}
+	return validateHeaderString(h.Comment)
+}
+
+// validateHeaderString checks the GZIP (RFC 1952) requirement that
+// header strings are NUL-terminated ISO 8859-1 (Latin-1).
+func validateHeaderString(s string) error {
+	for _, v := range s {
+		if v == 0 || v > 0xff {
+			return errors.New("gzip.Write: non-Latin-1 header string")
+		}
+	}
+	return nil
 }
 
 // GZIP (RFC 1952) is little-endian, unlike ZLIB (RFC 1950).
@@ -311,21 +381,28 @@ func (z *Writer) Write(p []byte) (int, error) {
 	}
 	// Write the GZIP header lazily.
 	if !z.wroteHeader {
+		// When the header was explicitly frozen, serialize the
+		// immutable snapshot; otherwise keep the historical lazy
+		// semantics and read the embedded Header fields directly.
+		h := &z.Header
+		if z.frozen != nil {
+			h = z.frozen
+		}
 		z.wroteHeader = true
 		z.buf[0] = gzipID1
 		z.buf[1] = gzipID2
 		z.buf[2] = gzipDeflate
 		z.buf[3] = 0
-		if z.Extra != nil {
+		if h.Extra != nil {
 			z.buf[3] |= 0x04
 		}
-		if z.Name != "" {
+		if h.Name != "" {
 			z.buf[3] |= 0x08
 		}
-		if z.Comment != "" {
+		if h.Comment != "" {
 			z.buf[3] |= 0x10
 		}
-		put4(z.buf[4:8], uint32(z.ModTime.Unix()))
+		put4(z.buf[4:8], uint32(h.ModTime.Unix()))
 		if z.level == BestCompression {
 			z.buf[8] = 2
 		} else if z.level == BestSpeed {
@@ -333,7 +410,7 @@ func (z *Writer) Write(p []byte) (int, error) {
 		} else {
 			z.buf[8] = 0
 		}
-		z.buf[9] = z.OS
+		z.buf[9] = h.OS
 		var n int
 		var err error
 		n, err = z.w.Write(z.buf[0:10])
@@ -341,22 +418,22 @@ func (z *Writer) Write(p []byte) (int, error) {
 			z.pushError(err)
 			return n, err
 		}
-		if z.Extra != nil {
-			err = z.writeBytes(z.Extra)
+		if h.Extra != nil {
+			err = z.writeBytes(h.Extra)
 			if err != nil {
 				z.pushError(err)
 				return n, err
 			}
 		}
-		if z.Name != "" {
-			err = z.writeString(z.Name)
+		if h.Name != "" {
+			err = z.writeString(h.Name)
 			if err != nil {
 				z.pushError(err)
 				return n, err
 			}
 		}
-		if z.Comment != "" {
-			err = z.writeString(z.Comment)
+		if h.Comment != "" {
+			err = z.writeString(h.Comment)
 			if err != nil {
 				z.pushError(err)
 				return n, err
