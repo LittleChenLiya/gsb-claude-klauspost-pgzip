@@ -166,6 +166,11 @@ func NewReaderN(r io.Reader, blockSize, blocks int) (*Reader, error) {
 // Reset discards the Reader z's state and makes it equivalent to the
 // result of its original state from NewReader, but reading from r instead.
 // This permits reusing a Reader rather than allocating a new one.
+//
+// Reset keeps its historical behavior: it tears down the current stream
+// before validating r, so a bad header in r can leave z unusable. Use
+// ResetKeep when the new header must be validated before the active reader
+// (and its stream) is replaced.
 func (z *Reader) Reset(r io.Reader) error {
 	z.killReadAhead()
 	z.r = makeReader(r)
@@ -196,6 +201,114 @@ func (z *Reader) Reset(r io.Reader) error {
 		return err
 	}
 	return nil
+}
+
+// ResetKeep is a non-destructive Reset adapter.
+//
+// Unlike Reset, it first builds a throwaway candidate reader for r and
+// validates r's gzip header on that candidate. The active reader z is only
+// replaced when the candidate header parses successfully. If the candidate
+// header is invalid (or r fails early), ResetKeep returns the error and leaves
+// z completely untouched: reads from the previous stream can continue exactly
+// where they left off, and every buffer (and any background read) owned by the
+// rejected candidate is reclaimed before ResetKeep returns.
+//
+// On success the semantics match Reset: the old stream state, including any
+// unread data and its read-ahead goroutine, is discarded and z starts serving
+// the decompressed content of r.
+func (z *Reader) ResetKeep(r io.Reader) error {
+	candidate, err := newResetCandidate(r, z.blocks, z.blockSize)
+	if err != nil {
+		return err
+	}
+	return z.commitCandidate(candidate)
+}
+
+// newResetCandidate creates a reader over r and parses its first header
+// without touching any active reader. On failure the candidate is fully
+// discarded and a nil reader is returned together with the error.
+func newResetCandidate(r io.Reader, blocks, blockSize int) (*Reader, error) {
+	// Account for too small values, matching NewReaderN/Reset.
+	if blocks <= 0 {
+		blocks = defaultBlocks
+	}
+	if blockSize <= 512 {
+		blockSize = defaultBlockSize
+	}
+	c := &Reader{
+		blocks:    blocks,
+		blockSize: blockSize,
+	}
+	c.r = makeReader(r)
+	c.digest = crc32.NewIEEE()
+	c.multistream.Store(true)
+	c.blockPool = make(chan []byte, c.blocks)
+	for i := 0; i < c.blocks; i++ {
+		c.blockPool <- make([]byte, c.blockSize)
+	}
+	if err := c.readHeader(true); err != nil {
+		// The header did not validate: never publish the candidate,
+		// and release everything it allocated.
+		c.discard()
+		return nil, err
+	}
+	return c, nil
+}
+
+// commitCandidate installs an already validated candidate as the active
+// reader. The previous stream is torn down (its read-ahead goroutine stopped
+// and its block buffers dropped) before the candidate state takes over.
+func (z *Reader) commitCandidate(c *Reader) error {
+	// Stop any background reading of the old stream first.
+	z.killReadAhead()
+
+	z.r = c.r
+	z.Header = c.Header
+	z.flg = c.flg
+	z.buf = c.buf
+	z.decompressor = c.decompressor
+	z.digest = c.digest
+	z.size = c.size
+	z.err = nil
+	z.closeErr = nil
+	z.closeReader = nil
+	z.readAhead = nil
+	z.roff = 0
+	z.current = nil
+	z.lastBlock = false
+	z.blocks = c.blocks
+	z.blockSize = c.blockSize
+	z.multistream.Store(true)
+	z.readAheadStarted.Store(false)
+
+	// Adopt the candidate's pre-filled pool and drop the old pool's
+	// buffers; killReadAhead above returned all of them to the old pool.
+	oldPool := z.blockPool
+	z.blockPool = c.blockPool
+	c.blockPool = nil
+	if oldPool != nil {
+		for range cap(oldPool) {
+			<-oldPool
+		}
+	}
+	return nil
+}
+
+// discard releases all resources owned by a reset candidate that will never be
+// committed: its (defensively stopped) background read, its decompressor and
+// every block buffer allocated from its pool.
+func (z *Reader) discard() {
+	z.killReadAhead()
+	if z.decompressor != nil {
+		_ = z.decompressor.Close()
+		z.decompressor = nil
+	}
+	if z.blockPool != nil {
+		for range cap(z.blockPool) {
+			<-z.blockPool
+		}
+		z.blockPool = nil
+	}
 }
 
 // Multistream controls whether the reader supports multistream files.

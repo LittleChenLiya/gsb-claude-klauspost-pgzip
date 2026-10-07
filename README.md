@@ -129,5 +129,18 @@ This is pretty much an optimal situation for pgzip, but it reflects most common 
 
 I haven't included [bgzf](https://godoc.org/github.com/biogo/hts/bgzf) in this comparison, since it only can decompress files created by a compatible encoder, and therefore cannot be considered a generic gzip decompressor. But if you are able to compress your files with a bgzf compatible program, you can expect it to scale beyond 100%.
 
+### Non-destructive Reset
+
+`Reset(r)` keeps its standard behavior and discards the current stream before
+validating `r`. For cases where the new input must be validated before taking
+over the data flow, `ResetKeep(r)` first parses `r`'s gzip header on a
+throwaway candidate reader:
+
+* If the header is invalid the error is returned, the active reader and its
+  partially read stream are untouched, and all candidate buffers and any
+  background read are reclaimed.
+* If the header is valid the candidate is committed, replacing the active
+  reader exactly like `Reset`.
+
 # License
 This contains large portions of code from the go repository - see GO_LICENSE for more information. The changes are released under MIT License. See LICENSE for more information.
