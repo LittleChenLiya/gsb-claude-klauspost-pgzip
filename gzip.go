@@ -39,6 +39,7 @@ const (
 // Writes to a Writer are compressed and written to w.
 type Writer struct {
 	Header
+	frozenHeader  *Header
 	w             io.Writer
 	level         int
 	wroteHeader   bool
@@ -144,6 +145,7 @@ func (z *Writer) init(w io.Writer, level int) {
 		digest = crc32.NewIEEE()
 	}
 	z.Header = Header{OS: 255}
+	z.frozenHeader = nil
 	z.w = w
 	z.level = level
 	z.digest = digest
@@ -177,12 +179,67 @@ func (z *Writer) init(w io.Writer, level int) {
 // result of its original state from NewWriter or NewWriterLevel, but
 // writing to w instead. This permits reusing a Writer rather than
 // allocating a new one.
+//
+// Reset also clears any header snapshot made with FreezeHeader,
+// so a new snapshot must be made if freezing is wanted again.
 func (z *Writer) Reset(w io.Writer) {
 	if z.results != nil && !z.closed {
 		close(z.results)
 	}
 	z.SetConcurrency(defaultBlockSize, runtime.GOMAXPROCS(0))
 	z.init(w, z.level)
+}
+
+// validHeaderString returns an error if s cannot be stored in a gzip header.
+// GZIP (RFC 1952) specifies that strings are NUL-terminated ISO 8859-1 (Latin-1).
+func validHeaderString(s string) error {
+	for _, v := range s {
+		if v == 0 || v > 0xff {
+			return errors.New("gzip.Write: non-Latin-1 header string")
+		}
+	}
+	return nil
+}
+
+// validateHeader returns an error if h cannot be written as a gzip header.
+func validateHeader(h *Header) error {
+	if len(h.Extra) > 0xffff {
+		return errors.New("gzip.Write: Extra data is too large")
+	}
+	if err := validHeaderString(h.Name); err != nil {
+		return err
+	}
+	return validHeaderString(h.Comment)
+}
+
+// FreezeHeader validates the current Header and takes a snapshot of it.
+//
+// After a successful call, the first header written to the output will use
+// the snapshotted values; later modifications of the Writer.Header fields
+// (including the Extra slice contents) will not affect what is written.
+//
+// If the Header is invalid (for instance a non-Latin-1 or NUL-containing
+// Name/Comment, or Extra data that is too large), an error is returned
+// before any byte has been written to the output, and no snapshot is made.
+//
+// An error is also returned if the header has already been written.
+//
+// The snapshot is discarded by Reset, after which FreezeHeader may be
+// called again. If FreezeHeader is never called, the Writer keeps its
+// usual behavior: the Header fields are read lazily on the first Write.
+func (z *Writer) FreezeHeader() error {
+	if z.wroteHeader {
+		return errors.New("gzip: header already written")
+	}
+	if err := validateHeader(&z.Header); err != nil {
+		return err
+	}
+	h := z.Header
+	if h.Extra != nil {
+		h.Extra = append([]byte(nil), h.Extra...)
+	}
+	z.frozenHeader = &h
+	return nil
 }
 
 // GZIP (RFC 1952) is little-endian, unlike ZLIB (RFC 1950).
@@ -312,20 +369,25 @@ func (z *Writer) Write(p []byte) (int, error) {
 	// Write the GZIP header lazily.
 	if !z.wroteHeader {
 		z.wroteHeader = true
+		// Use the frozen snapshot if FreezeHeader was called.
+		hdr := &z.Header
+		if z.frozenHeader != nil {
+			hdr = z.frozenHeader
+		}
 		z.buf[0] = gzipID1
 		z.buf[1] = gzipID2
 		z.buf[2] = gzipDeflate
 		z.buf[3] = 0
-		if z.Extra != nil {
+		if hdr.Extra != nil {
 			z.buf[3] |= 0x04
 		}
-		if z.Name != "" {
+		if hdr.Name != "" {
 			z.buf[3] |= 0x08
 		}
-		if z.Comment != "" {
+		if hdr.Comment != "" {
 			z.buf[3] |= 0x10
 		}
-		put4(z.buf[4:8], uint32(z.ModTime.Unix()))
+		put4(z.buf[4:8], uint32(hdr.ModTime.Unix()))
 		if z.level == BestCompression {
 			z.buf[8] = 2
 		} else if z.level == BestSpeed {
@@ -333,7 +395,7 @@ func (z *Writer) Write(p []byte) (int, error) {
 		} else {
 			z.buf[8] = 0
 		}
-		z.buf[9] = z.OS
+		z.buf[9] = hdr.OS
 		var n int
 		var err error
 		n, err = z.w.Write(z.buf[0:10])
@@ -341,22 +403,22 @@ func (z *Writer) Write(p []byte) (int, error) {
 			z.pushError(err)
 			return n, err
 		}
-		if z.Extra != nil {
-			err = z.writeBytes(z.Extra)
+		if hdr.Extra != nil {
+			err = z.writeBytes(hdr.Extra)
 			if err != nil {
 				z.pushError(err)
 				return n, err
 			}
 		}
-		if z.Name != "" {
-			err = z.writeString(z.Name)
+		if hdr.Name != "" {
+			err = z.writeString(hdr.Name)
 			if err != nil {
 				z.pushError(err)
 				return n, err
 			}
 		}
-		if z.Comment != "" {
-			err = z.writeString(z.Comment)
+		if hdr.Comment != "" {
+			err = z.writeString(hdr.Comment)
 			if err != nil {
 				z.pushError(err)
 				return n, err
